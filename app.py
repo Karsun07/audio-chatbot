@@ -8,6 +8,11 @@ import yt_dlp
 import streamlit as st
 from dotenv import load_dotenv
 
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+
 # ---------- Setup ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -91,12 +96,67 @@ def assemblyai_stt(audio_filename):
     except Exception as e:
         logger.error(f"Error in speech-to-text: {e}")
         return None, None
-    
+
+# ---------- RAG: build the searchable index ----------
+LLM_MODEL = "llama3.2"
+EMBED_MODEL = "nomic-embed-text"
+
+
+def build_vectorstore(text):
+    # 1) Split the transcript into small overlapping chunks
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = splitter.create_documents([text])
+
+    # 2) Turn every chunk into numbers (embeddings) and store them in FAISS
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+
+    logger.info(f"Indexed {len(chunks)} chunks")
+    return vectorstore
+
+
+# ---------- RAG: answer a question ----------
+def answer_question(vectorstore, question):
+    # 1) RETRIEVE: find the 3 chunks closest in meaning to the question
+    docs = vectorstore.similarity_search(question, k=3)
+    context = "\n\n".join(d.page_content for d in docs)
+
+    # 2) AUGMENT: put those chunks into the prompt
+    prompt = f"""You are a helpful assistant. Answer the question using ONLY the
+transcript excerpts below. If the answer is not in the excerpts, say
+"I could not find that in the audio."
+
+Transcript excerpts:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+    # 3) GENERATE: let Llama write the answer
+    llm = ChatOllama(model=LLM_MODEL, temperature=0)
+    response = llm.invoke(prompt)
+    return response.content, docs
+
+
+# ---------- Summary ----------
+def generate_summary(text):
+    llm = ChatOllama(model=LLM_MODEL, temperature=0.3)
+    prompt = f"Summarize the following transcript in 3-5 sentences:\n\n{text}"
+    return llm.invoke(prompt).content
+ 
 # ---------- TEMPORARY TEST (delete later) ----------
 if __name__ == "__main__":
-    name = save_audio("https://www.youtube.com/watch?v=pDyaurLPeko")
-    print("Saved file:", name)
-    if name:
-        text, words = assemblyai_stt(name)
-        print("Transcript:", text)
-        print("Number of words with timestamps:", len(words) if words else 0)
+    with open("docs/transcription.txt", "r", encoding="utf-8") as f:
+        text = f.read()
+
+    print("Building index...")
+    vs = build_vectorstore(text)
+
+    print("\nSUMMARY:\n", generate_summary(text))
+
+    for q in ["Who scored the spectacular rocket goal?",
+              "What was significant about James Maddison's goal according to the commentary?",
+              "Who scored the final goal to cap off the match?"]:
+        answer, _ = answer_question(vs, q)
+        print(f"\nQ: {q}\nA: {answer}")
