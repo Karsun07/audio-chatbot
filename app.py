@@ -13,6 +13,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
+import bisect
+
 # ---------- Setup ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -104,9 +106,9 @@ EMBED_MODEL = "nomic-embed-text"
 
 def build_vectorstore(text):
     # 1) Split the transcript into small overlapping chunks
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=30, add_start_index=True)
     chunks = splitter.create_documents([text])
-
+    
     # 2) Turn every chunk into numbers (embeddings) and store them in FAISS
     embeddings = OllamaEmbeddings(model=EMBED_MODEL)
     vectorstore = FAISS.from_documents(chunks, embeddings)
@@ -123,7 +125,8 @@ def answer_question(vectorstore, question):
 
     # 2) AUGMENT: put those chunks into the prompt
     prompt = f"""You are a helpful assistant. Answer the question using ONLY the
-transcript excerpts below. If the answer is not in the excerpts, say
+transcript excerpts below. Reply in 1-3 sentences in your own words. Do not
+copy the excerpts. If the answer is not in the excerpts, say
 "I could not find that in the audio."
 
 Transcript excerpts:
@@ -144,19 +147,51 @@ def generate_summary(text):
     llm = ChatOllama(model=LLM_MODEL, temperature=0.3)
     prompt = f"Summarize the following transcript in 3-5 sentences:\n\n{text}"
     return llm.invoke(prompt).content
- 
+
+# ---------- Timestamps ----------
+def build_char_offsets(text, words):
+    """For each word, find where it starts inside the full transcript text."""
+    offsets = []
+    cursor = 0
+    for w in words:
+        pos = text.find(w["text"], cursor)
+        if pos != -1:
+            offsets.append(pos)
+            cursor = pos + len(w["text"])
+        else:
+            offsets.append(cursor)  # fallback if a word can't be matched
+    return offsets
+
+
+def find_relevant_timestamps(docs, text, words):
+    """Map retrieved chunks to the time (in seconds) they were spoken."""
+    offsets = build_char_offsets(text, words)
+    seconds = []
+    for d in docs:
+        start_index = d.metadata.get("start_index", 0)
+        i = bisect.bisect_right(offsets, start_index) - 1
+        i = max(i, 0)
+        seconds.append(words[i]["start"] // 1000)  # milliseconds -> seconds
+    return sorted(set(seconds))
+
+
+def format_time(s):
+    return f"{s // 60}:{s % 60:02d}"
+
 # ---------- TEMPORARY TEST (delete later) ----------
 if __name__ == "__main__":
     with open("docs/transcription.txt", "r", encoding="utf-8") as f:
         text = f.read()
+    with open("docs/word_timestamps.json", "r", encoding="utf-8") as f:
+        words = json.load(f)
 
-    print("Building index...")
     vs = build_vectorstore(text)
 
-    print("\nSUMMARY:\n", generate_summary(text))
 
     for q in ["Who scored the spectacular rocket goal?",
               "What was significant about James Maddison's goal according to the commentary?",
               "Who scored the final goal to cap off the match?"]:
-        answer, _ = answer_question(vs, q)
+        answer, docs = answer_question(vs, q)
+        times = find_relevant_timestamps(docs, text, words)
         print(f"\nQ: {q}\nA: {answer}")
+        print("Timestamps:", [format_time(t) for t in times])
