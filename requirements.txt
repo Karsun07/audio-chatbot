@@ -1,0 +1,8 @@
+streamlit
+yt-dlp
+requests
+python-dotenv
+langchain
+langchain-community
+langchain-ollama
+faiss-cpu
