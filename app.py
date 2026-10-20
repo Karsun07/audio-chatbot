@@ -45,9 +45,58 @@ def save_audio(url):
         logger.error(f"Error downloading audio: {e}")
         return None
 
+# ---------- Convert audio to text ----------
+def assemblyai_stt(audio_filename):
+    try:
+        audio_path = os.path.join("temp", audio_filename)
 
+        # 1) Upload the audio file to AssemblyAI
+        with open(audio_path, "rb") as f:
+            response = requests.post(BASE_URL + "/upload", headers=HEADERS, data=f)
+        response.raise_for_status()
+        upload_url = response.json()["upload_url"]
+
+        # 2) Ask AssemblyAI to transcribe the uploaded file
+        response = requests.post(
+            BASE_URL + "/transcript",
+            json={"audio_url": upload_url},
+            headers=HEADERS,
+        )
+        response.raise_for_status()
+        transcript_id = response.json()["id"]
+
+        # 3) Keep checking until the transcript is ready
+        polling_url = f"{BASE_URL}/transcript/{transcript_id}"
+        while True:
+            result = requests.get(polling_url, headers=HEADERS).json()
+            if result["status"] == "completed":
+                break
+            elif result["status"] == "error":
+                raise RuntimeError(f"Transcription failed: {result['error']}")
+            time.sleep(3)
+
+        text = result["text"]
+        words = result["words"]
+
+        # 4) Save results to disk
+        os.makedirs("docs", exist_ok=True)
+        with open("docs/transcription.txt", "w", encoding="utf-8") as f:
+            f.write(text)
+        with open("docs/word_timestamps.json", "w", encoding="utf-8") as f:
+            json.dump(words, f)
+
+        logger.info("Transcription saved")
+        return text, words
+
+    except Exception as e:
+        logger.error(f"Error in speech-to-text: {e}")
+        return None, None
+    
 # ---------- TEMPORARY TEST (delete later) ----------
 if __name__ == "__main__":
-    print("Key loaded:", ASSEMBLY_AI_KEY is not None)
     name = save_audio("https://www.youtube.com/watch?v=pDyaurLPeko")
     print("Saved file:", name)
+    if name:
+        text, words = assemblyai_stt(name)
+        print("Transcript:", text)
+        print("Number of words with timestamps:", len(words) if words else 0)
