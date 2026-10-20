@@ -178,20 +178,276 @@ def find_relevant_timestamps(docs, text, words):
 def format_time(s):
     return f"{s // 60}:{s % 60:02d}"
 
-# ---------- TEMPORARY TEST (delete later) ----------
+# ---------- Cleanup ----------
+def cleanup_temp_files():
+    if os.path.isdir("temp"):
+        for f in os.listdir("temp"):
+            try:
+                os.remove(os.path.join("temp", f))
+            except OSError:
+                pass
+
+
+# ---------- Run the whole pipeline for one video ----------
+def process_video(url):
+    with st.status("Processing video...", expanded=True) as status:
+        st.write("⬇️ Downloading audio...")
+        audio = save_audio(url)
+        if not audio:
+            status.update(label="Could not download audio", state="error")
+            return False
+
+        st.write("📝 Transcribing speech (this can take a minute)...")
+        text, words = assemblyai_stt(audio)
+        if not text:
+            status.update(label="Transcription failed", state="error")
+            return False
+
+        st.write("🧠 Building the search index...")
+        vectorstore = build_vectorstore(text)
+
+        st.write("✨ Writing a summary...")
+        summary = generate_summary(text)
+
+        cleanup_temp_files()
+        status.update(label="Ready! Ask your questions.", state="complete")
+
+    st.session_state.vectorstore = vectorstore
+    st.session_state.text = text
+    st.session_state.words = words
+    st.session_state.summary = summary
+    st.session_state.url = url
+    st.session_state.history = []
+    st.session_state.video_start = 0
+    st.session_state.chunks = vectorstore.index.ntotal
+    st.session_state.duration = words[-1]["end"] // 1000
+    return True
+
+
+# ---------- Small helpers ----------
+def jump_to(seconds):
+    st.session_state.video_start = seconds
+
+
+def ask(q):
+    st.session_state.pending_q = q
+
+
+def reset_all():
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+
+
+def stat_card(label, value):
+    return (f'<div class="stat"><div class="stat-value">{value}</div>'
+            f'<div class="stat-label">{label}</div></div>')
+
+
+# ---------- Styling ----------
+CUSTOM_CSS = """
+<style>
+.block-container {padding-top: 1.5rem; max-width: 1300px;}
+#MainMenu, footer {visibility: hidden;}
+
+.hero {
+    background: linear-gradient(135deg, #4f46e5 0%, #9333ea 55%, #ec4899 100%);
+    padding: 2rem 2.4rem; border-radius: 20px; color: white;
+    margin-bottom: 1.2rem; box-shadow: 0 10px 30px rgba(147, 51, 234, 0.25);
+}
+.hero h1 {margin: 0; font-size: 2.3rem; color: white; font-weight: 800;}
+.hero p {margin: 0.4rem 0 0.9rem; opacity: 0.92; font-size: 1.05rem;}
+.pipe {display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;}
+.pipe span {
+    background: rgba(255,255,255,0.18); padding: 0.25rem 0.8rem;
+    border-radius: 999px; font-size: 0.85rem; font-weight: 600;
+}
+
+.stat, .feature {
+    background: rgba(128,128,128,0.10); border: 1px solid rgba(128,128,128,0.25);
+    border-radius: 14px; padding: 0.9rem 1rem; text-align: center;
+}
+.stat-value {font-size: 1.6rem; font-weight: 800; color: #8b5cf6;}
+.stat-label {font-size: 0.8rem; opacity: 0.75; text-transform: uppercase; letter-spacing: 0.05em;}
+.feature {text-align: left; height: 100%;}
+.feature h4 {margin: 0 0 0.4rem;}
+.feature p {margin: 0; opacity: 0.8; font-size: 0.92rem;}
+
+div.stButton > button {border-radius: 12px; font-weight: 600;}
+[data-testid="stChatMessage"] {border-radius: 14px;}
+</style>
+"""
+
+
+def render_sidebar():
+    with st.sidebar:
+        st.markdown("## 🔊 ChatAudio")
+        st.caption("RAG over any YouTube video, running on local LLMs.")
+        st.divider()
+
+        st.markdown("**Tech stack**")
+        st.markdown(
+            "- 🎞️ yt-dlp + ffmpeg\n"
+            "- 🗣️ AssemblyAI (speech-to-text)\n"
+            "- 🧩 LangChain\n"
+            f"- 🧠 Ollama: `{LLM_MODEL}`\n"
+            f"- 🔢 Embeddings: `{EMBED_MODEL}`\n"
+            "- 📦 FAISS vector store\n"
+            "- 🖥️ Streamlit"
+        )
+        st.divider()
+
+        with st.expander("How does it work?"):
+            st.markdown(
+                "1. Download the audio\n"
+                "2. Transcribe it with word timestamps\n"
+                "3. Split the text into chunks\n"
+                "4. Turn chunks into embeddings, store in FAISS\n"
+                "5. Embed your question, retrieve the closest chunks\n"
+                "6. Llama answers using only those chunks\n"
+                "7. Chunk positions map back to video time"
+            )
+
+        if st.session_state.get("vectorstore") is not None:
+            st.button("🗑️ Clear chat", on_click=lambda: st.session_state.update(history=[]),
+                      use_container_width=True)
+            st.button("🔄 New video", on_click=reset_all, use_container_width=True)
+
+
+def render_landing():
+    st.markdown("#### What you can do")
+    a, b, c = st.columns(3)
+    a.markdown('<div class="feature"><h4>💬 Ask anything</h4>'
+               '<p>Chat with a video and get answers grounded in what was actually said.</p></div>',
+               unsafe_allow_html=True)
+    b.markdown('<div class="feature"><h4>⏱️ Jump to the moment</h4>'
+               '<p>Every answer comes with clickable timestamps that open the video at that point.</p></div>',
+               unsafe_allow_html=True)
+    c.markdown('<div class="feature"><h4>🔍 See the sources</h4>'
+               '<p>Check the exact transcript chunks the AI used. No black box.</p></div>',
+               unsafe_allow_html=True)
+
+
+# ---------- The web page ----------
+def main():
+    st.set_page_config(layout="wide", page_title="ChatAudio", page_icon="🔊")
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    defaults = {
+        "vectorstore": None, "text": None, "words": None, "summary": None,
+        "url": None, "history": [], "video_start": 0, "pending_q": None,
+        "chunks": 0, "duration": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    render_sidebar()
+
+    # Hero header
+    st.markdown("""
+    <div class="hero">
+        <h1>🔊 Chat with Your Audio</h1>
+        <p>Paste a YouTube link and talk to the video. Answers come with timestamps and sources.</p>
+        <div class="pipe">
+            <span>Download</span> → <span>Transcribe</span> → <span>Embed</span>
+            → <span>Retrieve</span> → <span>Answer</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Input row
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...",
+                            label_visibility="collapsed")
+    with c2:
+        go = st.button("Process video", type="primary", use_container_width=True)
+
+    if go:
+        if url.strip():
+            process_video(url.strip())
+        else:
+            st.warning("Please paste a link first.")
+
+    if st.session_state.vectorstore is None:
+        render_landing()
+        return
+
+    # Stat cards
+    d = st.session_state.duration
+    s1, s2, s3, s4 = st.columns(4)
+    s1.markdown(stat_card("Duration", format_time(d)), unsafe_allow_html=True)
+    s2.markdown(stat_card("Words", len(st.session_state.words)), unsafe_allow_html=True)
+    s3.markdown(stat_card("Chunks indexed", st.session_state.chunks), unsafe_allow_html=True)
+    s4.markdown(stat_card("Model", LLM_MODEL), unsafe_allow_html=True)
+    st.write("")
+
+    left, right = st.columns([5, 6], gap="large")
+
+    # Left: video + tabs
+    with left:
+        st.video(st.session_state.url, start_time=st.session_state.video_start)
+        tab_sum, tab_txt = st.tabs(["📌 Summary", "📄 Transcript"])
+        with tab_sum:
+            st.write(st.session_state.summary)
+        with tab_txt:
+            st.text_area("Transcript", st.session_state.text, height=260,
+                         label_visibility="collapsed")
+            st.download_button("Download transcript", st.session_state.text,
+                               file_name="transcript.txt")
+
+    # Right: chat
+    with right:
+        st.subheader("💬 Chat")
+
+        if not st.session_state.history:
+            st.caption("Try one of these:")
+            q1, q2, q3 = st.columns(3)
+            q1.button("What is this about?", on_click=ask,
+                      args=("What is this audio about?",), use_container_width=True)
+            q2.button("Key points", on_click=ask,
+                      args=("What are the key points mentioned?",), use_container_width=True)
+            q3.button("Who is mentioned?", on_click=ask,
+                      args=("Which people are mentioned?",), use_container_width=True)
+
+        chat_box = st.container(height=470, border=True)
+        with chat_box:
+            if not st.session_state.history:
+                st.caption("No messages yet. Ask your first question below 👇")
+            for i, msg in enumerate(st.session_state.history):
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+                    times = msg.get("timestamps")
+                    if times:
+                        cols = st.columns(min(len(times), 4) + 1)
+                        for col, t in zip(cols, times[:4]):
+                            col.button(f"▶ {format_time(t)}", key=f"ts_{i}_{t}",
+                                       on_click=jump_to, args=(t,))
+                    sources = msg.get("sources")
+                    if sources:
+                        with st.expander("🔍 Sources used"):
+                            for n, src in enumerate(sources, 1):
+                                st.markdown(f"**Chunk {n}**")
+                                st.caption(src)
+
+    # Chat input (pinned to bottom of the page)
+    typed = st.chat_input("Ask something about the audio...")
+    question = typed or st.session_state.pending_q
+    st.session_state.pending_q = None
+
+    if question:
+        with st.spinner("Thinking..."):
+            answer, docs = answer_question(st.session_state.vectorstore, question)
+            times = find_relevant_timestamps(
+                docs, st.session_state.text, st.session_state.words
+            )
+        st.session_state.history.append({"role": "user", "content": question})
+        st.session_state.history.append({
+            "role": "assistant", "content": answer,
+            "timestamps": times, "sources": [d.page_content for d in docs],
+        })
+        st.rerun()
+
+
 if __name__ == "__main__":
-    with open("docs/transcription.txt", "r", encoding="utf-8") as f:
-        text = f.read()
-    with open("docs/word_timestamps.json", "r", encoding="utf-8") as f:
-        words = json.load(f)
-
-    vs = build_vectorstore(text)
-
-
-    for q in ["Who scored the spectacular rocket goal?",
-              "What was significant about James Maddison's goal according to the commentary?",
-              "Who scored the final goal to cap off the match?"]:
-        answer, docs = answer_question(vs, q)
-        times = find_relevant_timestamps(docs, text, words)
-        print(f"\nQ: {q}\nA: {answer}")
-        print("Timestamps:", [format_time(t) for t in times])
+    main()

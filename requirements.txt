@@ -5,4 +5,6 @@ python-dotenv
 langchain
 langchain-community
 langchain-ollama
+langchain-text-splitters
+langchain-core
 faiss-cpu
